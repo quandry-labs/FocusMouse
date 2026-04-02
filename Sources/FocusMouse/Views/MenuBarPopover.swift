@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MenuBarPopover: View {
     @Bindable var settings: AppSettings
+    var updater: Updater
     let isAccessibilityGranted: Bool
     let onRequestPermission: () -> Void
     let onQuit: () -> Void
@@ -47,6 +48,10 @@ struct MenuBarPopover: View {
                 .onChange(of: settings.showInDock) { _, newValue in
                     NSApplication.shared.setActivationPolicy(newValue ? .regular : .accessory)
                 }
+
+            Divider()
+
+            UpdateView(updater: updater)
 
             Divider()
 

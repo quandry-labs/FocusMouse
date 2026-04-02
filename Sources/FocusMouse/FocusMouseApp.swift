@@ -5,6 +5,7 @@ struct FocusMouseApp: App {
     @State private var settings = AppSettings()
     @State private var focuser = WindowFocuser()
     @State private var tracker: MouseTracker?
+    @State private var updater = Updater()
 
     init() {
         let settings = AppSettings()
@@ -18,6 +19,7 @@ struct FocusMouseApp: App {
         MenuBarExtra {
             MenuBarPopover(
                 settings: settings,
+                updater: updater,
                 isAccessibilityGranted: focuser.isAccessibilityTrusted,
                 onRequestPermission: { focuser.requestAccessibilityPermission() },
                 onQuit: { NSApplication.shared.terminate(nil) }
@@ -25,6 +27,7 @@ struct FocusMouseApp: App {
             .task {
                 startTracker()
                 focuser.startPollingPermission()
+                await updater.checkForUpdate()
             }
             .onChange(of: focuser.isAccessibilityTrusted) { _, granted in
                 if granted {
