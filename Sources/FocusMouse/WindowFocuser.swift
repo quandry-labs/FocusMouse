@@ -1,9 +1,33 @@
 import ApplicationServices
 import Cocoa
+import Observation
 
+@Observable
 final class WindowFocuser: WindowFocusing {
-    var isAccessibilityTrusted: Bool {
-        AXIsProcessTrusted()
+    private(set) var isAccessibilityTrusted: Bool = AXIsProcessTrusted()
+    private var pollTimer: Timer?
+
+    func checkPermission() {
+        isAccessibilityTrusted = AXIsProcessTrusted()
+    }
+
+    /// Poll for permission changes every 2 seconds until granted, then stop.
+    func startPollingPermission() {
+        guard !isAccessibilityTrusted else { return }
+        stopPollingPermission()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            self.checkPermission()
+            if self.isAccessibilityTrusted {
+                timer.invalidate()
+                self.pollTimer = nil
+            }
+        }
+    }
+
+    func stopPollingPermission() {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 
     func focusWindow(pid: pid_t, raiseWindow: Bool) -> Bool {
@@ -11,7 +35,6 @@ final class WindowFocuser: WindowFocusing {
 
         let app = AXUIElementCreateApplication(pid)
 
-        // Activate the application
         let nsApp = NSRunningApplication(processIdentifier: pid)
         nsApp?.activate()
 
@@ -28,8 +51,9 @@ final class WindowFocuser: WindowFocusing {
     }
 
     func requestAccessibilityPermission() {
-        let promptKey = kAXTrustedCheckOptionPrompt.takeRetainedValue() as CFString
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as CFString
         let options = [promptKey: true] as CFDictionary
         AXIsProcessTrustedWithOptions(options)
+        startPollingPermission()
     }
 }

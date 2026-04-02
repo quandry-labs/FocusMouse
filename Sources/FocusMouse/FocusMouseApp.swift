@@ -23,14 +23,27 @@ struct FocusMouseApp: App {
                 onQuit: { NSApplication.shared.terminate(nil) }
             )
             .task {
-                guard tracker == nil else { return }
-                let newTracker = MouseTracker(settings: settings, focuser: focuser)
-                tracker = newTracker
-                newTracker.start()
+                startTracker()
+                focuser.startPollingPermission()
+            }
+            .onChange(of: focuser.isAccessibilityTrusted) { _, granted in
+                if granted {
+                    // Recreate the event tap now that we have permission
+                    tracker?.stop()
+                    tracker = nil
+                    startTracker()
+                }
             }
         } label: {
             Image(systemName: settings.isEnabled ? "cursorarrow.motionlines" : "cursorarrow")
         }
         .menuBarExtraStyle(.window)
+    }
+
+    private func startTracker() {
+        guard tracker == nil else { return }
+        let newTracker = MouseTracker(settings: settings, focuser: focuser)
+        tracker = newTracker
+        newTracker.start()
     }
 }
