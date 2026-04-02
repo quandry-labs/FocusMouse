@@ -51,7 +51,6 @@ fi
 echo "==> Ad-hoc signing..."
 codesign --force --sign - \
     --entitlements "$PROJECT_DIR/FocusMouse.entitlements" \
-    --options runtime \
     "$APP_BUNDLE"
 
 echo "==> App bundle created at: $APP_BUNDLE"
