@@ -41,15 +41,11 @@ cp "$PROJECT_DIR/FocusMouse.entitlements" "$BUILD_DIR/"
 # Create PkgInfo
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
-# Copy resources if they exist
-if [ -d "$PROJECT_DIR/Resources/Assets.xcassets" ]; then
-    # Compile asset catalog if actool is available
-    if command -v actool &> /dev/null; then
-        actool --compile "$APP_BUNDLE/Contents/Resources" \
-            --platform macosx \
-            --minimum-deployment-target 14.0 \
-            "$PROJECT_DIR/Resources/Assets.xcassets" 2>/dev/null || true
-    fi
+# Copy app icon
+if [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
+    cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
+else
+    echo "WARNING: AppIcon.icns not found. Run: swift scripts/generate-icon.swift . && iconutil -c icns Resources/AppIcon.iconset -o Resources/AppIcon.icns"
 fi
 
 echo "==> Ad-hoc signing..."
