@@ -32,22 +32,20 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 cd "$PROJECT_DIR"
-swift build -c release --arch arm64 --arch x86_64
-BINARY_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+swift build -c release --arch arm64
+BINARY_DIR="$(swift build -c release --arch arm64 --show-bin-path)"
 BINARY="$BINARY_DIR/$APP_NAME"
 
 if [ ! -f "$BINARY" ]; then
-    echo "ERROR: Universal release binary was not produced." >&2
+    echo "ERROR: arm64 release binary was not produced." >&2
     exit 1
 fi
 
 ARCHITECTURES="$(lipo -archs "$BINARY")"
-for REQUIRED_ARCH in arm64 x86_64; do
-    if [[ " $ARCHITECTURES " != *" $REQUIRED_ARCH "* ]]; then
-        echo "ERROR: Missing required architecture: $REQUIRED_ARCH" >&2
-        exit 1
-    fi
-done
+if [ "$ARCHITECTURES" != "arm64" ]; then
+    echo "ERROR: Expected an arm64-only binary, found: $ARCHITECTURES" >&2
+    exit 1
+fi
 
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"

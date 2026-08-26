@@ -171,8 +171,7 @@ private extension FourCharCode {
 private final class SMCClient {
     private static let keyProbeRetryInterval: TimeInterval = 60
     private static let temperatureKeys = [
-        // Package / proximity keys used on Intel and across several Apple
-        // Silicon generations.
+        // Package / proximity keys shared across several SMC generations.
         "TCMz", "TCAD", "TC0D", "TC0P", "TC0H",
         // M1 family.
         "Tp09", "Tp0T", "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b",

@@ -32,6 +32,7 @@ open build/FocusMouse.dmg
 
 ## Requirements
 
+- Apple silicon Mac
 - macOS 14.0 (Sonoma) or later
 - Accessibility permission (the app will prompt you)
 
@@ -67,11 +68,11 @@ DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer swift test
 # Debug build
 swift build
 
-# Local universal build + DMG (ad-hoc signed; not for distribution)
+# Local arm64 build + DMG (ad-hoc signed; not for distribution)
 bash scripts/build-app.sh --local
 ```
 
-The build script produces and verifies a universal arm64 + x86_64 binary. Distribution builds fail closed unless a Developer ID identity and notarization profile are supplied:
+The build script produces and verifies an arm64-only binary for Apple silicon. Distribution builds fail closed unless a Developer ID identity and notarization profile are supplied:
 
 ```bash
 FOCUSMOUSE_SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
