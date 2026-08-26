@@ -3,14 +3,6 @@ import Darwin
 import Observation
 import SwiftUI
 
-struct StorageOffender: Equatable, Identifiable, Sendable {
-    let name: String
-    let bytes: UInt64
-    let icon: String
-
-    var id: String { name }
-}
-
 enum SoftwareUpdateStatus: Equatable, Sendable {
     case checking
     case upToDate
@@ -42,8 +34,6 @@ struct SystemHUDSnapshot: Equatable, Sendable {
     let hardwareTelemetry: HardwareTelemetrySample
     var networkReceiveHistory: [Double]
     var networkTransmitHistory: [Double]
-    var storageOffenders: [StorageOffender]
-    var storageScanComplete: Bool
     var softwareUpdateStatus: SoftwareUpdateStatus
 
     static let placeholder = SystemHUDSnapshot(
@@ -70,8 +60,6 @@ struct SystemHUDSnapshot: Equatable, Sendable {
         hardwareTelemetry: .placeholder,
         networkReceiveHistory: [],
         networkTransmitHistory: [],
-        storageOffenders: [],
-        storageScanComplete: false,
         softwareUpdateStatus: .checking
     )
 }
@@ -149,8 +137,6 @@ actor SystemMetricsSampler {
             hardwareTelemetry: hardwareTelemetry,
             networkReceiveHistory: [],
             networkTransmitHistory: [],
-            storageOffenders: [],
-            storageScanComplete: false,
             softwareUpdateStatus: .checking
         )
     }
@@ -253,7 +239,7 @@ actor SystemMetricsSampler {
     }
 
     private func diskUsage() -> (free: UInt64?, total: UInt64?) {
-        guard let attributes = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()) else {
+        guard let attributes = try? FileManager.default.attributesOfFileSystem(forPath: "/") else {
             return (nil, nil)
         }
         let free = (attributes[.systemFreeSize] as? NSNumber)?.uint64Value
@@ -452,83 +438,6 @@ private extension Sequence where Element: Hashable {
     }
 }
 
-actor StorageUsageScanner {
-    private struct Candidate: Sendable {
-        let name: String
-        let url: URL
-        let icon: String
-    }
-
-    private var cachedResult: [StorageOffender] = []
-    private var lastScan: Date?
-
-    func scan() async -> [StorageOffender] {
-        if let lastScan, Date().timeIntervalSince(lastScan) < 1_800 {
-            return cachedResult
-        }
-
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [
-            Candidate(name: "Downloads", url: home.appendingPathComponent("Downloads"), icon: "arrow.down.circle.fill"),
-            Candidate(name: "Applications", url: home.appendingPathComponent("Applications"), icon: "app.fill"),
-            Candidate(name: "Movies", url: home.appendingPathComponent("Movies"), icon: "film.fill"),
-            Candidate(name: "Music", url: home.appendingPathComponent("Music"), icon: "music.note"),
-            Candidate(name: "Pictures", url: home.appendingPathComponent("Pictures"), icon: "photo.fill"),
-            Candidate(name: "App Support", url: home.appendingPathComponent("Library/Application Support"), icon: "shippingbox.fill"),
-            Candidate(name: "Caches", url: home.appendingPathComponent("Library/Caches"), icon: "archivebox.fill"),
-            Candidate(name: "Containers", url: home.appendingPathComponent("Library/Containers"), icon: "square.stack.3d.up.fill")
-        ]
-
-        let result = await Task.detached(priority: .utility) {
-            candidates.compactMap { candidate -> StorageOffender? in
-                guard !Task.isCancelled else { return nil }
-                let bytes = Self.directorySize(candidate.url)
-                guard bytes > 0 else { return nil }
-                return StorageOffender(name: candidate.name, bytes: bytes, icon: candidate.icon)
-            }
-            .sorted { $0.bytes > $1.bytes }
-            .prefix(3)
-            .map { $0 }
-        }.value
-
-        cachedResult = result
-        lastScan = Date()
-        return result
-    }
-
-    private nonisolated static func directorySize(_ directory: URL) -> UInt64 {
-        let keys: Set<URLResourceKey> = [
-            .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .totalFileAllocatedSizeKey,
-            .fileAllocatedSizeKey
-        ]
-        guard let enumerator = FileManager.default.enumerator(
-            at: directory,
-            includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles],
-            errorHandler: { _, _ in true }
-        ) else {
-            return 0
-        }
-
-        var total: UInt64 = 0
-        var visited = 0
-        while let file = enumerator.nextObject() as? URL {
-            if Task.isCancelled || visited >= 250_000 { break }
-            visited += 1
-            guard let values = try? file.resourceValues(forKeys: keys),
-                  values.isRegularFile == true,
-                  values.isSymbolicLink != true
-            else {
-                continue
-            }
-            total += UInt64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-        }
-        return total
-    }
-}
-
 actor SoftwareUpdateChecker {
     private var cachedStatus: SoftwareUpdateStatus?
 
@@ -596,11 +505,9 @@ final class SystemHUDController {
     private(set) var snapshot = SystemHUDSnapshot.placeholder
 
     @ObservationIgnored private let sampler = SystemMetricsSampler()
-    @ObservationIgnored private let storageScanner = StorageUsageScanner()
     @ObservationIgnored private let softwareUpdateChecker = SoftwareUpdateChecker()
     @ObservationIgnored private var panels: [CGDirectDisplayID: NSPanel] = [:]
     @ObservationIgnored private var sampleTask: Task<Void, Never>?
-    @ObservationIgnored private var storageTask: Task<Void, Never>?
     @ObservationIgnored private var softwareUpdateTask: Task<Void, Never>?
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var screenChangeObserver: NSObjectProtocol?
@@ -632,8 +539,6 @@ final class SystemHUDController {
         timer = nil
         sampleTask?.cancel()
         sampleTask = nil
-        storageTask?.cancel()
-        storageTask = nil
         softwareUpdateTask?.cancel()
         softwareUpdateTask = nil
         if let screenChangeObserver {
@@ -663,7 +568,7 @@ final class SystemHUDController {
         }
         updatePanels()
         refresh()
-        refreshSlowMetrics()
+        refreshSoftwareUpdateStatus()
     }
 
     private func restartTimer() {
@@ -695,8 +600,6 @@ final class SystemHUDController {
             )
             guard !Task.isCancelled else { return }
             var mergedSnapshot = snapshot
-            mergedSnapshot.storageOffenders = self.snapshot.storageOffenders
-            mergedSnapshot.storageScanComplete = self.snapshot.storageScanComplete
             mergedSnapshot.softwareUpdateStatus = self.snapshot.softwareUpdateStatus
             mergedSnapshot.networkReceiveHistory = self.appendingHistory(
                 self.snapshot.networkReceiveHistory,
@@ -711,22 +614,7 @@ final class SystemHUDController {
         }
     }
 
-    private func refreshSlowMetrics() {
-        if storageTask == nil {
-            let storageScanner = storageScanner
-            storageTask = Task { [weak self] in
-                let offenders = await storageScanner.scan()
-                guard let self, !Task.isCancelled else { return }
-                var updated = self.snapshot
-                updated.storageOffenders = offenders
-                updated.storageScanComplete = true
-                self.snapshot = updated
-                self.storageTask = nil
-                await Task.yield()
-                self.resizePanels(animated: true)
-            }
-        }
-
+    private func refreshSoftwareUpdateStatus() {
         if softwareUpdateTask == nil {
             let softwareUpdateChecker = softwareUpdateChecker
             softwareUpdateTask = Task { [weak self] in
@@ -1778,7 +1666,7 @@ private struct StorageInsightsCard: View {
             VStack(alignment: .leading, spacing: 13) {
                 HUDSectionHeader(
                     title: "Storage",
-                    subtitle: "Largest readable folders",
+                    subtitle: "Startup disk capacity",
                     icon: "internaldrive.fill",
                     tint: HUDPalette.amber
                 )
@@ -1788,29 +1676,18 @@ private struct StorageInsightsCard: View {
                     progress: usedFraction,
                     tint: HUDPalette.amber
                 )
-                if snapshot.storageOffenders.isEmpty, !snapshot.storageScanComplete {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Scanning storage hotspots…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(minHeight: 55)
-                } else if snapshot.storageOffenders.isEmpty {
-                    Label("No readable folder totals", systemImage: "folder.badge.questionmark")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(minHeight: 55)
-                } else {
-                    VStack(spacing: 8) {
-                        ForEach(snapshot.storageOffenders) { offender in
-                            StorageOffenderRow(
-                                offender: offender,
-                                relativeSize: Double(offender.bytes) / Double(snapshot.storageOffenders.first?.bytes ?? 1)
-                            )
-                        }
-                    }
-                }
+                IdentityRow(
+                    icon: "externaldrive.fill",
+                    title: freeText,
+                    detail: "Available capacity",
+                    tint: HUDPalette.sage
+                )
+                IdentityRow(
+                    icon: "lock.shield.fill",
+                    title: "Aggregate capacity only",
+                    detail: "No folders or file contents scanned",
+                    tint: HUDPalette.slate
+                )
             }
         }
         .frame(maxWidth: .infinity)
@@ -1826,40 +1703,12 @@ private struct StorageInsightsCard: View {
         return "\(byteText(total - min(total, free))) / \(byteText(total))"
     }
 
+    private var freeText: String {
+        snapshot.diskFree.map(byteText) ?? "Sampling…"
+    }
+
     private func byteText(_ value: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .binary)
-    }
-}
-
-private struct StorageOffenderRow: View {
-    let offender: StorageOffender
-    let relativeSize: Double
-
-    var body: some View {
-        HStack(spacing: 9) {
-            HUDAccentIcon(
-                symbol: offender.icon,
-                tint: HUDPalette.amber,
-                size: 26,
-                symbolSize: 12,
-                cornerRadius: 8
-            )
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(offender.name).font(.caption).lineLimit(1)
-                    Spacer(minLength: 8)
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(offender.bytes), countStyle: .binary))
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
-                GeometryReader { proxy in
-                    Capsule()
-                        .fill(HUDPalette.amber)
-                        .frame(width: proxy.size.width * min(1, max(0.05, relativeSize)))
-                }
-                .frame(height: 5)
-            }
-        }
     }
 }
 

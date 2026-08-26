@@ -6,6 +6,18 @@ import Testing
 @MainActor
 @Suite("System HUD controller", .serialized)
 struct SystemHUDControllerTests {
+    @Test("storage metrics use aggregate filesystem capacity")
+    func storageUsesAggregateCapacity() async {
+        let snapshot = await SystemMetricsSampler().sample(includeNetworkDetails: false)
+
+        #expect(snapshot.diskFree != nil)
+        #expect(snapshot.diskTotal != nil)
+        if let free = snapshot.diskFree, let total = snapshot.diskTotal {
+            #expect(total > 0)
+            #expect(free <= total)
+        }
+    }
+
     @Test("HUD panels cannot receive mouse or keyboard focus")
     func panelIsClickThrough() {
         let suiteName = "test-hud-controller-\(UUID().uuidString)"
