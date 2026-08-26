@@ -2,21 +2,26 @@ import AppKit
 import Foundation
 import Observation
 
-/// Lightweight self-updater that checks GitHub releases for newer versions.
-/// Downloads the DMG, mounts it, replaces the app, and relaunches.
+@MainActor
 @Observable
 final class Updater {
-    // Configure this to your GitHub repo
+    struct ReleaseResponse: Sendable {
+        let statusCode: Int
+        let finalURL: URL?
+    }
+
+    typealias ResponseLoader = @Sendable (URLRequest) async throws -> ReleaseResponse
+
     static let repoOwner = "quandry-labs"
     static let repoName = "FocusMouse"
-    static let releasesURL = "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases/latest"
+    static let latestReleaseURL = URL(
+        string: "https://github.com/\(repoOwner)/\(repoName)/releases/latest"
+    )!
 
     enum State: Equatable {
         case idle
         case checking
-        case available(version: String, url: String)
-        case downloading(progress: Double)
-        case installing
+        case available(version: String, url: URL)
         case upToDate
         case error(String)
     }
@@ -24,181 +29,175 @@ final class Updater {
     private(set) var state: State = .idle
     private(set) var lastChecked: Date?
 
-    var currentVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    @ObservationIgnored private let responseLoader: ResponseLoader
+    private let installedVersion: String
+
+    var currentVersion: String { installedVersion }
+
+    init(
+        session: URLSession = .shared,
+        currentVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+            ?? "0.0.0"
+    ) {
+        self.responseLoader = { request in
+            let (_, response) = try await session.data(for: request)
+            let httpResponse = response as? HTTPURLResponse
+            return ReleaseResponse(
+                statusCode: httpResponse?.statusCode ?? -1,
+                finalURL: httpResponse?.url
+            )
+        }
+        self.installedVersion = currentVersion
     }
 
-    // MARK: - Check for updates
+    init(currentVersion: String, responseLoader: @escaping ResponseLoader) {
+        self.responseLoader = responseLoader
+        self.installedVersion = currentVersion
+    }
 
     func checkForUpdate() async {
+        guard state != .checking else { return }
         state = .checking
         defer { lastChecked = Date() }
 
-        guard let url = URL(string: Self.releasesURL) else {
-            state = .error("Invalid release URL")
-            return
-        }
-
         do {
-            var request = URLRequest(url: url)
-            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-            request.timeoutInterval = 15
+            var request = URLRequest(
+                url: Self.latestReleaseURL,
+                cachePolicy: .reloadRevalidatingCacheData,
+                timeoutInterval: 15
+            )
+            request.httpMethod = "HEAD"
+            request.setValue("FocusMouse/\(currentVersion)", forHTTPHeaderField: "User-Agent")
 
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                state = .error("GitHub API returned non-200 status")
+            let response = try await responseLoader(request)
+            guard (200..<300).contains(response.statusCode),
+                  let releaseURL = response.finalURL,
+                  let latestVersion = Self.version(fromReleaseURL: releaseURL)
+            else {
+                state = .error("Could not validate the latest release")
                 return
             }
 
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tagName = json["tag_name"] as? String,
-                  let assets = json["assets"] as? [[String: Any]] else {
-                state = .error("Could not parse release info")
-                return
-            }
-
-            let latestVersion = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
-
-            guard isNewer(latestVersion, than: currentVersion) else {
+            if Self.isNewer(latestVersion, than: currentVersion) {
+                state = .available(version: latestVersion, url: releaseURL)
+            } else {
                 state = .upToDate
-                return
             }
-
-            // Find the DMG asset
-            let dmgAsset = assets.first { asset in
-                (asset["name"] as? String)?.hasSuffix(".dmg") == true
-            }
-
-            guard let downloadURL = dmgAsset?["browser_download_url"] as? String else {
-                state = .error("No DMG found in release \(latestVersion)")
-                return
-            }
-
-            state = .available(version: latestVersion, url: downloadURL)
+        } catch is CancellationError {
+            state = .idle
         } catch {
-            state = .error(error.localizedDescription)
+            state = .error("Update check failed: \(error.localizedDescription)")
         }
     }
 
-    // MARK: - Download and install
-
-    func downloadAndInstall(url downloadURLString: String) async {
-        guard let downloadURL = URL(string: downloadURLString) else {
-            state = .error("Invalid download URL")
-            return
+    @discardableResult
+    func openReleasePage(_ url: URL) -> Bool {
+        guard Self.version(fromReleaseURL: url) != nil else {
+            state = .error("Refused an invalid release URL")
+            return false
         }
 
-        state = .downloading(progress: 0)
+        let opened = NSWorkspace.shared.open(url)
+        if !opened {
+            state = .error("Could not open the release page")
+        }
+        return opened
+    }
 
-        do {
-            // Download to temp
-            let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("FocusMouse-update-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            let dmgPath = tempDir.appendingPathComponent("FocusMouse.dmg")
+    static func version(fromReleaseURL url: URL) -> String? {
+        guard url.scheme == "https",
+              url.host?.lowercased() == "github.com"
+        else {
+            return nil
+        }
 
-            let (localURL, _) = try await URLSession.shared.download(from: downloadURL)
-            try FileManager.default.moveItem(at: localURL, to: dmgPath)
+        let expectedPrefix = "/\(repoOwner)/\(repoName)/releases/tag/"
+        guard url.path.hasPrefix(expectedPrefix) else { return nil }
 
-            state = .installing
+        let tag = String(url.path.dropFirst(expectedPrefix.count))
+        guard !tag.isEmpty, !tag.contains("/") else { return nil }
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        return SemanticVersion(version) == nil ? nil : version
+    }
 
-            // Mount the DMG
-            let mountPoint = tempDir.appendingPathComponent("mount")
-            try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+    static func isNewer(_ remote: String, than local: String) -> Bool {
+        guard let remoteVersion = SemanticVersion(remote),
+              let localVersion = SemanticVersion(local)
+        else {
+            return false
+        }
+        return remoteVersion > localVersion
+    }
+}
 
-            let mountProcess = Process()
-            mountProcess.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-            mountProcess.arguments = ["attach", dmgPath.path, "-mountpoint", mountPoint.path, "-nobrowse", "-quiet"]
-            try mountProcess.run()
-            mountProcess.waitUntilExit()
+private struct SemanticVersion: Comparable {
+    let numbers: [Int]
+    let prerelease: [String]?
 
-            guard mountProcess.terminationStatus == 0 else {
-                state = .error("Failed to mount DMG")
-                return
+    init?(_ value: String) {
+        let withoutBuildMetadata = value.split(separator: "+", maxSplits: 1).first.map(String.init) ?? value
+        let parts = withoutBuildMetadata.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let numberParts = parts[0].split(separator: ".", omittingEmptySubsequences: false)
+
+        guard !numberParts.isEmpty,
+              numberParts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }),
+              numberParts.allSatisfy({ $0.count == 1 || $0.first != "0" }),
+              numberParts.count <= 4
+        else {
+            return nil
+        }
+
+        let numbers = numberParts.compactMap { Int($0) }
+        guard numbers.count == numberParts.count else { return nil }
+        self.numbers = numbers
+
+        if parts.count == 2 {
+            let identifiers = parts[1].split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            guard !identifiers.isEmpty,
+                  identifiers.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } })
+            else {
+                return nil
             }
-
-            defer {
-                // Unmount
-                let unmount = Process()
-                unmount.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-                unmount.arguments = ["detach", mountPoint.path, "-quiet"]
-                try? unmount.run()
-                unmount.waitUntilExit()
-                // Cleanup temp
-                try? FileManager.default.removeItem(at: tempDir)
-            }
-
-            // Find the .app in the mounted DMG
-            let contents = try FileManager.default.contentsOfDirectory(at: mountPoint, includingPropertiesForKeys: nil)
-            guard let appBundle = contents.first(where: { $0.pathExtension == "app" }) else {
-                state = .error("No .app found in DMG")
-                return
-            }
-
-            // Replace the current app
-            guard let currentAppURL = Bundle.main.bundleURL as URL? else {
-                state = .error("Cannot determine current app location")
-                return
-            }
-
-            // Use a staging path next to the current app
-            let parent = currentAppURL.deletingLastPathComponent()
-            let stagingURL = parent.appendingPathComponent("FocusMouse-new.app")
-            let backupURL = parent.appendingPathComponent("FocusMouse-old.app")
-
-            // Copy new app to staging
-            if FileManager.default.fileExists(atPath: stagingURL.path) {
-                try FileManager.default.removeItem(at: stagingURL)
-            }
-            try FileManager.default.copyItem(at: appBundle, to: stagingURL)
-
-            // Swap: current → backup, staging → current
-            if FileManager.default.fileExists(atPath: backupURL.path) {
-                try FileManager.default.removeItem(at: backupURL)
-            }
-            try FileManager.default.moveItem(at: currentAppURL, to: backupURL)
-            try FileManager.default.moveItem(at: stagingURL, to: currentAppURL)
-
-            // Clean up backup
-            try? FileManager.default.removeItem(at: backupURL)
-
-            // Relaunch
-            relaunch(at: currentAppURL)
-
-        } catch {
-            state = .error("Update failed: \(error.localizedDescription)")
+            self.prerelease = identifiers
+        } else {
+            self.prerelease = nil
         }
     }
 
-    // MARK: - Helpers
-
-    private func isNewer(_ remote: String, than local: String) -> Bool {
-        let r = remote.split(separator: ".").compactMap { Int($0) }
-        let l = local.split(separator: ".").compactMap { Int($0) }
-        for i in 0..<max(r.count, l.count) {
-            let rv = i < r.count ? r[i] : 0
-            let lv = i < l.count ? l[i] : 0
-            if rv > lv { return true }
-            if rv < lv { return false }
+    static func < (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
+        let componentCount = max(lhs.numbers.count, rhs.numbers.count)
+        for index in 0..<componentCount {
+            let left = index < lhs.numbers.count ? lhs.numbers[index] : 0
+            let right = index < rhs.numbers.count ? rhs.numbers[index] : 0
+            if left != right { return left < right }
         }
-        return false
-    }
 
-    private func relaunch(at appURL: URL) {
-        // Use open to relaunch after a brief delay
-        let script = """
-        sleep 1
-        open "\(appURL.path)"
-        """
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", script]
-        try? process.run()
+        switch (lhs.prerelease, rhs.prerelease) {
+        case (nil, nil):
+            return false
+        case (.some, nil):
+            return true
+        case (nil, .some):
+            return false
+        case let (.some(left), .some(right)):
+            for index in 0..<max(left.count, right.count) {
+                guard index < left.count else { return true }
+                guard index < right.count else { return false }
 
-        // Exit the current instance
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            NSApplication.shared.terminate(self)
+                let leftNumber = Int(left[index])
+                let rightNumber = Int(right[index])
+                switch (leftNumber, rightNumber) {
+                case let (.some(leftValue), .some(rightValue)) where leftValue != rightValue:
+                    return leftValue < rightValue
+                case (.some, nil):
+                    return true
+                case (nil, .some):
+                    return false
+                default:
+                    if left[index] != right[index] { return left[index] < right[index] }
+                }
+            }
+            return false
         }
     }
 }

@@ -5,87 +5,102 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 APP_NAME="FocusMouse"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
-DMG_NAME="$APP_NAME.dmg"
-DMG_PATH="$BUILD_DIR/$DMG_NAME"
+DMG_PATH="$BUILD_DIR/$APP_NAME.dmg"
+BUILD_MODE="${1:---local}"
 
-echo "==> Cleaning build directory..."
+if [ "$BUILD_MODE" != "--local" ] && [ "$BUILD_MODE" != "--release" ]; then
+    echo "Usage: $0 [--local|--release]" >&2
+    exit 64
+fi
+
+if [ ! -f "$PROJECT_DIR/Package.swift" ] || [ "$BUILD_DIR" != "$PROJECT_DIR/build" ]; then
+    echo "ERROR: Refusing to build from an unexpected project path." >&2
+    exit 1
+fi
+
+SIGN_IDENTITY="${FOCUSMOUSE_SIGN_IDENTITY:-}"
+NOTARY_PROFILE="${FOCUSMOUSE_NOTARY_PROFILE:-}"
+
+if [ "$BUILD_MODE" = "--release" ]; then
+    if [ -z "$SIGN_IDENTITY" ] || [ -z "$NOTARY_PROFILE" ]; then
+        echo "ERROR: Release builds require FOCUSMOUSE_SIGN_IDENTITY and FOCUSMOUSE_NOTARY_PROFILE." >&2
+        exit 1
+    fi
+fi
+
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-echo "==> Building release binary..."
 cd "$PROJECT_DIR"
-swift build -c release --arch arm64 --arch x86_64 2>&1
-
-BINARY="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/$APP_NAME"
+swift build -c release --arch arm64 --arch x86_64
+BINARY_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+BINARY="$BINARY_DIR/$APP_NAME"
 
 if [ ! -f "$BINARY" ]; then
-    echo "ERROR: Binary not found at $BINARY"
-    echo "Trying single-arch build..."
-    swift build -c release 2>&1
-    BINARY="$(swift build -c release --show-bin-path)/$APP_NAME"
+    echo "ERROR: Universal release binary was not produced." >&2
+    exit 1
 fi
 
-echo "==> Creating app bundle..."
-mkdir -p "$APP_BUNDLE/Contents/MacOS"
-mkdir -p "$APP_BUNDLE/Contents/Resources"
+ARCHITECTURES="$(lipo -archs "$BINARY")"
+for REQUIRED_ARCH in arm64 x86_64; do
+    if [[ " $ARCHITECTURES " != *" $REQUIRED_ARCH "* ]]; then
+        echo "ERROR: Missing required architecture: $REQUIRED_ARCH" >&2
+        exit 1
+    fi
+done
 
-# Copy binary
+mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-
-# Copy Info.plist
 cp "$PROJECT_DIR/Info.plist" "$APP_BUNDLE/Contents/"
-
-# Copy entitlements (for reference, not embedded)
-cp "$PROJECT_DIR/FocusMouse.entitlements" "$BUILD_DIR/"
-
-# Create PkgInfo
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
-# Copy app icon
-if [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
-    cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
+if [ ! -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
+    echo "ERROR: Resources/AppIcon.icns is missing." >&2
+    exit 1
+fi
+cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
+cp "$PROJECT_DIR/Resources/PrivacyInfo.xcprivacy" "$APP_BUNDLE/Contents/Resources/"
+cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/"
+
+if [ "$BUILD_MODE" = "--release" ]; then
+    codesign --force \
+        --sign "$SIGN_IDENTITY" \
+        --options runtime \
+        --timestamp \
+        --entitlements "$PROJECT_DIR/FocusMouse.entitlements" \
+        "$APP_BUNDLE"
 else
-    echo "WARNING: AppIcon.icns not found. Run: swift scripts/generate-icon.swift . && iconutil -c icns Resources/AppIcon.iconset -o Resources/AppIcon.icns"
+    codesign --force \
+        --sign - \
+        --entitlements "$PROJECT_DIR/FocusMouse.entitlements" \
+        "$APP_BUNDLE"
 fi
 
-echo "==> Ad-hoc signing..."
-codesign --force --sign - \
-    --entitlements "$PROJECT_DIR/FocusMouse.entitlements" \
-    "$APP_BUNDLE"
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
-echo "==> App bundle created at: $APP_BUNDLE"
-
-echo "==> Creating DMG..."
-
-# Create a temporary directory for DMG contents
 DMG_STAGING="$BUILD_DIR/dmg-staging"
 mkdir -p "$DMG_STAGING"
-
-# Copy app to staging
+trap 'rm -rf "$DMG_STAGING"' EXIT
 cp -R "$APP_BUNDLE" "$DMG_STAGING/"
-
-# Create Applications symlink for drag-to-install
 ln -s /Applications "$DMG_STAGING/Applications"
 
-# Create DMG
-hdiutil create \
-    -volname "$APP_NAME" \
-    -srcfolder "$DMG_STAGING" \
-    -ov \
-    -format UDZO \
+diskutil image create from \
+    --format UDZO \
+    --volumeName "$APP_NAME" \
+    "$DMG_STAGING" \
     "$DMG_PATH"
 
-# Clean up staging
-rm -rf "$DMG_STAGING"
+if [ "$BUILD_MODE" = "--release" ]; then
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+    codesign --verify --strict --verbose=2 "$DMG_PATH"
+    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
+    spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG_PATH"
+else
+    echo "Local ad-hoc build created. It is not suitable for distribution."
+fi
 
-echo ""
-echo "==> Build complete!"
-echo "    App:  $APP_BUNDLE"
-echo "    DMG:  $DMG_PATH"
-echo ""
-echo "To install:"
-echo "    open $DMG_PATH"
-echo "    Drag FocusMouse to Applications"
-echo ""
-echo "Or install directly:"
-echo "    cp -R $APP_BUNDLE /Applications/"
+echo "App: $APP_BUNDLE"
+echo "DMG: $DMG_PATH"

@@ -1,26 +1,34 @@
-import Foundation
+import CoreGraphics
 import Testing
 @testable import FocusMouse
 
+@MainActor
 @Suite("WindowFocuser")
 struct WindowFocuserTests {
     @Test("reports accessibility trust status")
     func accessibilityTrustStatus() {
         let focuser = WindowFocuser()
-        let _ = focuser.isAccessibilityTrusted
+        _ = focuser.isAccessibilityTrusted
+        focuser.stopPollingPermission()
     }
 
-    @Test("mock focuser records calls")
+    @Test("mock records exact target window and point")
     func mockFocuserRecordsCalls() {
         let mock = MockWindowFocuser()
-        mock.focusResult = true
+        let point = CGPoint(x: 12, y: 24)
+        let window = WindowInfo(
+            windowID: 7,
+            ownerPID: 123,
+            ownerBundleID: "com.example.target",
+            ownerName: "Target",
+            bounds: .zero,
+            layer: 0,
+            isOnScreen: true
+        )
 
-        let result = mock.focusWindow(pid: 123, raiseWindow: true)
+        let result = mock.focusWindow(window, at: point, raiseWindow: true)
 
-        #expect(result == true)
-        #expect(mock.focusCalls.count == 1)
-        #expect(mock.focusCalls[0].pid == 123)
-        #expect(mock.focusCalls[0].raiseWindow == true)
+        #expect(result)
+        #expect(mock.focusCalls == [.init(window: window, point: point, raiseWindow: true)])
     }
 }
-

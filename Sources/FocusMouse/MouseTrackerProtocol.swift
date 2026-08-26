@@ -1,7 +1,9 @@
 import Foundation
 
+@MainActor
 protocol MouseTracking {
     var isRunning: Bool { get }
-    func start()
+    @discardableResult
+    func start() -> Bool
     func stop()
 }

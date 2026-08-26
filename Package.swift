@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.4
 
 import PackageDescription
 
@@ -8,13 +8,13 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "FocusMouse",
-            path: "Sources/FocusMouse",
-            resources: [.process("../../Resources")]
+            path: "Sources/FocusMouse"
         ),
         .testTarget(
             name: "FocusMouseTests",
             dependencies: ["FocusMouse"],
             path: "Tests/FocusMouseTests"
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

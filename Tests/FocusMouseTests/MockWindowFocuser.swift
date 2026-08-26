@@ -1,13 +1,21 @@
+import CoreGraphics
 import Foundation
 @testable import FocusMouse
 
+@MainActor
 final class MockWindowFocuser: WindowFocusing {
-    var isAccessibilityTrusted: Bool = true
-    var focusResult: Bool = true
-    var focusCalls: [(pid: pid_t, raiseWindow: Bool)] = []
+    struct FocusCall: Equatable {
+        let window: WindowInfo
+        let point: CGPoint
+        let raiseWindow: Bool
+    }
 
-    func focusWindow(pid: pid_t, raiseWindow: Bool) -> Bool {
-        focusCalls.append((pid: pid, raiseWindow: raiseWindow))
+    var isAccessibilityTrusted = true
+    var focusResult = true
+    private(set) var focusCalls: [FocusCall] = []
+
+    func focusWindow(_ window: WindowInfo, at point: CGPoint, raiseWindow: Bool) -> Bool {
+        focusCalls.append(FocusCall(window: window, point: point, raiseWindow: raiseWindow))
         return focusResult
     }
 

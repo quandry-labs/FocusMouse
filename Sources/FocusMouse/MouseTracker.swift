@@ -1,81 +1,104 @@
 import Cocoa
 import CoreGraphics
 
+@MainActor
 final class MouseTracker: MouseTracking {
+    typealias WindowLookup = @MainActor (CGPoint, pid_t) -> WindowInfo?
+
+    /// Movement is observed passively. Button down/up events are deliberately
+    /// absent so FocusMouse cannot react to, suppress, or transform clicks.
+    static let observedEventTypes: [CGEventType] = [
+        .mouseMoved,
+        .leftMouseDragged,
+        .rightMouseDragged
+    ]
+
+    static var observedEventMask: CGEventMask {
+        observedEventTypes.reduce(0) { mask, type in
+            mask | (1 << type.rawValue)
+        }
+    }
+
     private let settings: AppSettings
     private let focuser: WindowFocusing
-    private let queue = DispatchQueue(label: "com.focusmouse.tracker", qos: .userInteractive)
+    private let windowLookup: WindowLookup
+    private let ownPID = ProcessInfo.processInfo.processIdentifier
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var debounceTimer: DispatchWorkItem?
-    private var lastFocusedPID: pid_t = 0
-    private let ownPID = ProcessInfo.processInfo.processIdentifier
+    private var retainedSelfPointer: UnsafeMutableRawPointer?
+    private var focusTask: Task<Void, Never>?
+    private var raiseTask: Task<Void, Never>?
+    private var latestPointerLocation: CGPoint?
 
     private(set) var isRunning = false
 
-    init(settings: AppSettings, focuser: WindowFocusing) {
+    init(
+        settings: AppSettings,
+        focuser: WindowFocusing,
+        windowLookup: @escaping WindowLookup = WindowInfo.windowAtPoint
+    ) {
         self.settings = settings
         self.focuser = focuser
+        self.windowLookup = windowLookup
     }
 
-    func start() {
-        guard !isRunning else { return }
+    @discardableResult
+    func start() -> Bool {
+        guard !isRunning else { return true }
 
-        let eventMask: CGEventMask = (1 << CGEventType.mouseMoved.rawValue)
-            | (1 << CGEventType.leftMouseDragged.rawValue)
-            | (1 << CGEventType.rightMouseDragged.rawValue)
-
-        let callback: CGEventTapCallBack = { proxy, type, event, refcon in
-            guard let refcon = refcon else { return Unmanaged.passRetained(event) }
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
             let tracker = Unmanaged<MouseTracker>.fromOpaque(refcon).takeUnretainedValue()
 
-            switch type {
-            case .tapDisabledByTimeout:
-                if let tap = tracker.eventTap {
-                    CGEvent.tapEnable(tap: tap, enable: true)
+            MainActor.assumeIsolated {
+                switch type {
+                case .tapDisabledByTimeout, .tapDisabledByUserInput:
+                    if let tap = tracker.eventTap {
+                        CGEvent.tapEnable(tap: tap, enable: true)
+                    }
+                default:
+                    tracker.handlePointerEvent(type: type, location: event.location)
                 }
-                return Unmanaged.passRetained(event)
-            default:
-                break
             }
 
-            if type == .leftMouseDragged || type == .rightMouseDragged {
-                tracker.cancelDebounce()
-                return Unmanaged.passRetained(event)
-            }
-
-            tracker.handleMouseMoved(event: event)
-            return Unmanaged.passRetained(event)
+            return Unmanaged.passUnretained(event)
         }
 
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        if let tap = CGEvent.tapCreate(
-            tap: .cghidEventTap,
-            place: .headInsertEventTap,
+        let selfPointer = Unmanaged.passRetained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .tailAppendEventTap,
             options: .listenOnly,
-            eventsOfInterest: eventMask,
+            eventsOfInterest: Self.observedEventMask,
             callback: callback,
-            userInfo: selfPtr
-        ) {
-            eventTap = tap
-            runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-
-            if let source = runLoopSource {
-                CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-            }
-
-            CGEvent.tapEnable(tap: tap, enable: true)
+            userInfo: selfPointer
+        ) else {
+            Unmanaged<MouseTracker>.fromOpaque(selfPointer).release()
+            return false
         }
-        // isRunning is set to true even if tap creation fails (e.g. no accessibility permission
-        // in test environments) so that the stopped/running state remains consistent.
+
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            CFMachPortInvalidate(tap)
+            Unmanaged<MouseTracker>.fromOpaque(selfPointer).release()
+            return false
+        }
+
+        eventTap = tap
+        runLoopSource = source
+        retainedSelfPointer = selfPointer
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
         isRunning = true
+        return true
     }
 
     func stop() {
-        cancelDebounce()
+        cancelScheduledWork()
 
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
         }
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
@@ -83,58 +106,84 @@ final class MouseTracker: MouseTracking {
 
         eventTap = nil
         runLoopSource = nil
+        latestPointerLocation = nil
         isRunning = false
+
+        if let selfPointer = retainedSelfPointer {
+            retainedSelfPointer = nil
+            Unmanaged<MouseTracker>.fromOpaque(selfPointer).release()
+        }
     }
 
-    private func handleMouseMoved(event: CGEvent) {
+    func handlePointerEvent(type: CGEventType, location: CGPoint) {
+        latestPointerLocation = location
+        cancelScheduledWork()
+
         guard settings.isEnabled else { return }
+        guard type == .mouseMoved else { return }
 
-        cancelDebounce()
+        // A one-frame minimum prevents 0 ms mode from enumerating all windows at raw mouse Hz.
+        let effectiveDelayMs = max(16, settings.focusDelayMs)
+        focusTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(effectiveDelayMs))
+            } catch {
+                return
+            }
 
-        let delayMs = settings.focusDelayMs
-        let work = DispatchWorkItem { [weak self] in
-            self?.performFocus()
+            guard let self, self.latestPointerLocation == location else { return }
+            self.focus(at: location)
+            self.focusTask = nil
         }
-        debounceTimer = work
-        queue.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: work)
     }
 
-    private func cancelDebounce() {
-        debounceTimer?.cancel()
-        debounceTimer = nil
-    }
-
-    private func performFocus() {
-        let mouseLocation = NSEvent.mouseLocation
-        guard let screenHeight = NSScreen.main?.frame.height else { return }
-        let cgPoint = CGPoint(x: mouseLocation.x, y: screenHeight - mouseLocation.y)
-
-        guard let window = WindowInfo.windowAtPoint(cgPoint, excludingPID: ownPID) else { return }
-
-        if let bundleID = window.ownerBundleID, settings.excludedBundleIDs.contains(bundleID) {
-            return
-        }
-
-        if window.ownerPID == lastFocusedPID {
-            return
-        }
-
-        lastFocusedPID = window.ownerPID
+    private func focus(at point: CGPoint) {
+        guard let window = eligibleWindow(at: point) else { return }
 
         let shouldRaise = settings.raiseWindow
         let raiseDelay = settings.raiseDelayMs
+        let focused = focuser.focusWindow(
+            window,
+            at: point,
+            raiseWindow: shouldRaise && raiseDelay == 0
+        )
+        guard focused, shouldRaise, raiseDelay > 0 else { return }
 
-        let _ = focuser.focusWindow(pid: window.ownerPID, raiseWindow: raiseDelay == 0 && shouldRaise)
-
-        if shouldRaise && raiseDelay > 0 {
-            queue.asyncAfter(deadline: .now() + .milliseconds(raiseDelay)) { [weak self] in
-                guard let self = self, self.lastFocusedPID == window.ownerPID else { return }
-                let _ = self.focuser.focusWindow(pid: window.ownerPID, raiseWindow: true)
+        raiseTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(raiseDelay))
+            } catch {
+                return
             }
+
+            guard let self,
+                  self.settings.isEnabled,
+                  self.latestPointerLocation == point,
+                  let currentWindow = self.eligibleWindow(at: point),
+                  currentWindow.windowID == window.windowID
+            else {
+                return
+            }
+
+            _ = self.focuser.focusWindow(currentWindow, at: point, raiseWindow: true)
+            self.raiseTask = nil
         }
     }
 
-    deinit {
-        stop()
+    private func eligibleWindow(at point: CGPoint) -> WindowInfo? {
+        guard let window = windowLookup(point, ownPID),
+              let bundleID = window.ownerBundleID,
+              !settings.excludedBundleIDs.contains(bundleID)
+        else {
+            return nil
+        }
+        return window
+    }
+
+    private func cancelScheduledWork() {
+        focusTask?.cancel()
+        focusTask = nil
+        raiseTask?.cancel()
+        raiseTask = nil
     }
 }

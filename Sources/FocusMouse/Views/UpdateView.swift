@@ -27,29 +27,12 @@ struct UpdateView: View {
                 Text("Update available: v\(version)")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                Button("Download & Install") {
-                    Task { await updater.downloadAndInstall(url: url) }
+                Button("View Release") {
+                    updater.openReleasePage(url)
                 }
                 .font(.caption)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-            }
-
-        case .downloading(let progress):
-            HStack(spacing: 6) {
-                ProgressView(value: progress)
-                    .frame(width: 100)
-                Text("Downloading...")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-        case .installing:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Installing...")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
         case .error(let message):
